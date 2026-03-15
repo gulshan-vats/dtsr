@@ -39,3 +39,10 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# python
+dtsr-proj/venv/
+dtsr-proj/__pycache__/
+dtsr-proj/*.pyc
+dtsr-proj/feedback.jsonl
+
