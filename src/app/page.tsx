@@ -12,8 +12,11 @@ import {
 import {
   SidebarInset,
   SidebarProvider,
-  useSidebar,
+  SidebarTrigger,
 } from "@/components/ui/sidebar"
+import ResearchPapersPanel from "@/components/research-papers-panel"
+import { useSidebar } from "@/components/ui/sidebar" // Corrected import for useSidebar
+import { useSearchParams, useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import {
   FileTextIcon,
@@ -22,6 +25,7 @@ import {
   PlusIcon,
   AudioLinesIcon,
   ChevronDownIcon,
+  ArrowDownIcon,
   SearchIcon,
   GlobeIcon,
   ArrowUpIcon,
@@ -41,11 +45,21 @@ import {
   RefreshCcwIcon,
   InfoIcon,
   CheckIcon,
+  LogOutIcon,
+  LogInIcon,
+  FolderIcon,
+  CalendarIcon,
+  LayoutGridIcon,
+  LockIcon,
+  StarIcon,
 } from "lucide-react"
+import { supabase } from "@/lib/supabase"
 import { cn } from "@/lib/utils"
 import { ChartBarMultiple } from "@/components/charts/chat-charts"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
+import { ChatMessage } from "@/components/chat-message"
+import { VISUALIZATION_SYSTEM_PROMPT } from "@/lib/systemPrompt"
 import {
   Bar,
   BarChart,
@@ -181,6 +195,9 @@ type ResearchPaper = {
   relevancy: number;
   tags: string[];
   summary: string;
+  abstract?: string;
+  authors?: string;
+  pdfUrl?: string | null;
 }
 
 type OptionsData = {
@@ -190,17 +207,6 @@ type OptionsData = {
 }
 
 const RESEARCH_PAPERS: ResearchPaper[] = [
-  {
-    id: "p1",
-    title: "Attention Is All You Need",
-    score: 98,
-    year: 2017,
-    citations: 120534,
-    publisher: "NeurIPS",
-    relevancy: 96,
-    tags: ["LLM", "Transformer", "NLP"],
-    summary: "Introducing the Transformer architecture, based solely on attention mechanisms, dispensing with recurrence and convolutions."
-  },
   {
     id: "p2",
     title: "Language Models are Few-Shot Learners",
@@ -227,17 +233,135 @@ function PageContent() {
   const [summaryPaperId, setSummaryPaperId] = React.useState<string | null>(null)
 
   // Chat state
-  const [messages, setMessages] = React.useState<{ role: 'user' | 'assistant'; content: string }[]>([])
+  const [messages, setMessages] = React.useState<{ 
+    role: 'user' | 'assistant'; 
+    content: string;
+    timestamp?: string;
+  }[]>([])
   const [isLoading, setIsLoading] = React.useState(false)
   const [uploadedDoc, setUploadedDoc] = React.useState<string | null>(null)
   const fileInputRef = React.useRef<HTMLInputElement>(null)
   const messagesEndRef = React.useRef<HTMLDivElement>(null)
   const [isDeepSearch, setIsDeepSearch] = React.useState(false)
   const [isWebMode, setIsWebMode] = React.useState(false)
-  const [toast, setToast] = React.useState<{ message: string; type: 'success' | 'info' } | null>(null)
+  const [isShareModalOpen, setIsShareModalOpen] = React.useState(false)
+  const [shareMode, setShareMode] = React.useState<'private' | 'public'>('private')
+  const [toast, setToast] = React.useState<{ message: string; type: 'success' | 'info' | 'success' } | null>(null)
   const [thinkingStep, setThinkingStep] = React.useState(0)
   const thinkingSteps = ["Gathering sources...", "Analyzing data...", "Synthesizing answer...", "Formulating response..."]
   const [papers, setPapers] = React.useState<ResearchPaper[]>(RESEARCH_PAPERS)
+  const [paperContexts, setPaperContexts] = React.useState<Record<string, string>>({})
+  const [projects, setProjects] = React.useState<any[]>([])
+
+  // Auth & Session state
+  const [user, setUser] = React.useState<any>(null)
+  const searchParams = useSearchParams()
+  const router = useRouter()
+  const activeProjectId = searchParams.get("project")
+  const randomId = React.useMemo(() => crypto.randomUUID(), [])
+  const sessionId = searchParams.get("session") || randomId
+  const [sessionTitle, setSessionTitle] = React.useState("New Research")
+  const lastLoadedSessionId = React.useRef<string | null>(null)
+  const [greeting, setGreeting] = React.useState("")
+  const [subGreeting, setSubGreeting] = React.useState("")
+
+  React.useEffect(() => {
+    const hour = new Date().getHours()
+    const name = user?.user_metadata?.full_name?.split(' ')[0] || "Orange"
+    
+    let g = ""
+    if (hour < 12) g = "Good morning"
+    else if (hour < 18) g = "Good afternoon"
+    else g = "Good evening"
+    
+    setGreeting(`${g}, ${name}`)
+
+    const questions = [
+      "What are we finding today?",
+      "Ready to dive into your research?",
+      "Let's explore some new papers.",
+      "What's on your mind for research?",
+      "Shall we continue our investigation?"
+    ]
+    setSubGreeting(questions[Math.floor(Math.random() * questions.length)])
+  }, [user])
+
+  // Load user and session on mount
+  React.useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user ?? null)
+    })
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null)
+    })
+
+    return () => subscription.unsubscribe()
+  }, [])
+
+  React.useEffect(() => {
+    if (!user) return
+    const fetchProjects = async () => {
+      const { data } = await supabase.from('projects').select('*').eq('user_id', user.id).order('created_at', { ascending: false })
+      if (data) setProjects(data)
+    }
+    fetchProjects()
+  }, [user])
+
+  // Load chat history and session title from Supabase
+  React.useEffect(() => {
+    if (!user) return
+
+    const loadSessionData = async () => {
+      // If we are already on this session and have messages, don't re-load history
+      if (lastLoadedSessionId.current === sessionId && messages.length > 0) return
+      
+      // Reset before loading a DIFFERENT session
+      if (lastLoadedSessionId.current !== sessionId) {
+        setMessages([])
+        setIsChatStarted(false)
+        lastLoadedSessionId.current = sessionId
+      }
+
+      const { data: history, error } = await supabase
+        .from('chat_messages')
+        .select('role, content')
+        .eq('user_id', user.id)
+        .eq('session_id', sessionId)
+        .order('created_at', { ascending: true })
+
+      if (history && history.length > 0) {
+        setMessages(history as any)
+        setIsChatStarted(true)
+      } else {
+        // Only set to false if we are sure it's a new empty session
+        setMessages([])
+        setIsChatStarted(false)
+      }
+
+      // Load Title
+      const { data: session } = await supabase
+        .from('sessions')
+        .select('title')
+        .eq('id', sessionId)
+        .single()
+      
+      if (session?.title) {
+        setSessionTitle(session.title)
+      } else {
+        setSessionTitle("New Research")
+      }
+    }
+
+    loadSessionData()
+  }, [user, sessionId])
+
+  // Dynamic Title Update
+  React.useEffect(() => {
+    if (sessionTitle) {
+      document.title = `${sessionTitle} | Revio`;
+    }
+  }, [sessionTitle])
 
   // Options state
   const [activeOptions, setActiveOptions] = React.useState<OptionsData | null>(null)
@@ -328,13 +452,23 @@ function PageContent() {
     } else {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" })
     }
+    // Also reset the state when manually scrolled
+    setShowScrollButton(false)
   }
 
   React.useEffect(() => {
     scrollToBottom()
   }, [messages, isLoading])
 
-  const projects = ["AI Ethics", "Transformer Research", "Deep Learning"]
+  const [showScrollButton, setShowScrollButton] = React.useState(false)
+
+  const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLDivElement
+    const { scrollTop, scrollHeight, clientHeight } = target
+    // Show button if we are scrolled up more than 100px from the bottom
+    const isAtBottom = scrollHeight - scrollTop - clientHeight < 100
+    setShowScrollButton(!isAtBottom)
+  }
 
   const isSidebarOpen = sidebarState === "expanded"
 
@@ -378,9 +512,42 @@ function PageContent() {
 
 
   // Send message to the backend
+  const handleSilentSearch = async (query: string) => {
+    setIsLoading(true);
+    try {
+      const searchRes = await fetch(`/api/search?q=${encodeURIComponent(query)}&limit=6`);
+      const searchData = await searchRes.json();
+      if (searchRes.ok && searchData.results) {
+        const newPapers = searchData.results.map((p: any) => ({
+          id: p.id,
+          title: p.title,
+          score: Math.floor(Math.random() * 20) + 80,
+          year: p.year,
+          citations: p.citations || 0,
+          authors: p.authors || "Unknown Authors",
+          abstract: p.abstract || "No abstract available.",
+          source: p.venue || "Semantic Scholar",
+          tags: p.tags && p.tags.length > 0 ? p.tags : ["Research", "Academic"],
+          url: p.url || "#"
+        }));
+        // Replace instead of merge for fresh context
+        setPapers(newPapers);
+        setToast({ message: `Loaded papers for "${query}"`, type: 'info' });
+      }
+    } catch (e) {
+      console.error("Silent search failed", e);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const handleSendMessage = async (query: string) => {
     if (!query.trim()) return
-    const userMsg = { role: 'user' as const, content: query }
+    const userMsg = { 
+      role: 'user' as const, 
+      content: query,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    }
     setMessages((prev) => [...prev, userMsg])
     setPromptValue("")
     setIsChatStarted(true)
@@ -388,41 +555,58 @@ function PageContent() {
     setIsLoading(true)
 
     try {
-      // Regular chat
-      // Context aware chat - inject pulled papers
       const pulledPapers = selectedOptions.filter(opt => opt.type === 'paper')
-      let contextInjection = ""
-
-      // Only inject context if NOT in Web Mode
-      if (!isWebMode && (pulledPapers.length > 0 || uploadedDoc)) {
-        contextInjection = "\n\n[CONTEXT: Use the following context to answer the user's question:]\n"
-        if (uploadedDoc) {
-          contextInjection += `- Active Document: ${uploadedDoc}\n`
-        }
-        pulledPapers.forEach(p => {
-          const paperData = papers.find(pp => pp.id === p.id)
-          if (paperData) {
-            contextInjection += `- Paper: ${paperData.title}\n  Summary: ${paperData.summary}\n`
-          }
-        })
-      }
-
       const finalQuery = isDeepSearch ? `Deep Research: ${query}` : query
-      // Explicitly tell the backend if we are in Web Mode
       const queryWithContext = isWebMode
         ? `[WEB_MODE_ONLY] ${finalQuery}`
-        : (contextInjection ? `${finalQuery}${contextInjection}` : finalQuery)
+        : finalQuery
+
+      // Build context based system prompt dynamically
+      let dynamicSystemPrompt = "You are Revio, an AI research assistant.\n\n";
+      let activeContext = "";
+
+      if (!isWebMode) {
+        pulledPapers.forEach(p => {
+          if (paperContexts[p.id]) {
+            activeContext += paperContexts[p.id] + "\n";
+          } else {
+            const paperData = papers.find(pp => pp.id === p.id);
+            if (paperData) {
+              activeContext += `Title: ${paperData.title}\nAbstract: ${paperData.abstract}\n[Full text unavailable]\n\n`;
+            }
+          }
+        });
+
+        if (uploadedDoc) {
+          activeContext += `\n[UPLOADED DOCUMENT REFERENCE: ${uploadedDoc}]\n`;
+        }
+      }
+
+      if (activeContext.trim()) {
+        // Final safeguard for total context size
+        const MAX_TOTAL_CONTEXT = 100000;
+        const finalContext = activeContext.length > MAX_TOTAL_CONTEXT 
+          ? activeContext.slice(0, MAX_TOTAL_CONTEXT) + "\n... [Context truncated for length]"
+          : activeContext;
+
+        dynamicSystemPrompt += `═══════════════════════════════\nLOADED PAPER — PRIMARY SOURCE\n═══════════════════════════════\n${finalContext}\nAnswer all questions using the paper above as your \nprimary reference. Quote specific sections when relevant.\nIf the answer is not found in the paper, say so clearly.\n═══════════════════════════════`;
+      } else {
+        dynamicSystemPrompt += "Answer based on your general research knowledge.";
+      }
 
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           query: queryWithContext,
-          history: messages.map(m => ({ role: m.role, content: m.content }))
+          session_id: sessionId,
+          user_id: user?.id || "guest",
+          history: messages.map(m => ({ role: m.role, content: m.content })),
+          system_prompt_suffix: dynamicSystemPrompt,
         }),
       })
       const data = await res.json()
-      let assistantContent = res.ok ? data.response : (data.error ?? "Something went wrong. Please try again.")
+      let assistantContent = res.ok ? data.response : (data.error || data.detail || "Something went wrong. Please try again.")
 
       // Robust Options Interceptor - Manual scanner for nested JSON
       const optionsStartTag = "[OPTIONS:";
@@ -465,7 +649,14 @@ function PageContent() {
                 setCurrentStepIndex(0);
                 setAllStepSelections({});
                 // Cleanly remove the tag from visibility
-                assistantContent = assistantContent.replace(fullTag, "").trim();
+                const nextContent = assistantContent.replace(fullTag, "").trim();
+                setMessages(prev => {
+                  const last = prev[prev.length - 1];
+                  if (last && last.role === 'assistant') {
+                    return [...prev.slice(0, -1), { role: 'assistant', content: nextContent }];
+                  }
+                  return prev;
+                });
                 hasOptions = true;
               } catch (e) {
                 console.error("Failed to parse extracted AI options", e);
@@ -486,16 +677,17 @@ function PageContent() {
           const searchData = await searchRes.json()
           if (searchRes.ok && searchData.results) {
             // Transform backend paper to frontend ResearchPaper format
-            const newPapers: ResearchPaper[] = searchData.results.map((p: any) => ({
+            const newPapers: any[] = searchData.results.map((p: any) => ({
               id: p.id,
               title: p.title,
               score: Math.floor(Math.random() * 20) + 80, // Mock score for UI
               year: p.year,
-              citations: p.citations,
-              publisher: "Semantic Scholar",
-              relevancy: Math.floor(Math.random() * 30) + 70,
-              tags: ["New", "Web Search"],
-              summary: p.abstract || "No abstract available."
+              citations: p.citations || 0,
+              authors: p.authors || "Unknown Authors",
+              abstract: p.abstract || "No abstract available for this research paper.",
+              source: p.venue || "Semantic Scholar",
+              tags: p.tags && p.tags.length > 0 ? p.tags : ["Research", "Academic"],
+              url: p.url || "#"
             }))
             setPapers(prev => [...newPapers, ...prev.slice(0, 10)])
             setToast({ message: `Found ${newPapers.length} new papers!`, type: 'info' })
@@ -508,16 +700,42 @@ function PageContent() {
         }
       }
 
+      // Final UI Polish: If the message is just a selector/search tag, add context text
+      if (assistantContent.replace(/\[SEARCH:.*\]/g, "").replace(/\[OPTIONS:.*\]/g, "").trim() === "") {
+        if (hasOptions) {
+          assistantContent = "I've generated some options to help refine your research. Please choose one below:"
+        } else if (searchMatch) {
+          assistantContent = "I'm searching for relevant papers based on your request. Results will appear in the document panel."
+        }
+      }
+
       setMessages((prev) => [...prev, {
         role: 'assistant',
         content: assistantContent,
       }])
+
+      // Trigger session naming if this is the first message
+      if (messages.length === 0 && user) {
+        console.log("DEBUG: Triggering session naming for first message", { query, sessionId });
+        fetch("/api/name-chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ first_message: query, session_id: sessionId, user_id: user.id })
+        }).then(async (r) => {
+          if (r.ok) {
+            const nameData = await r.json()
+            console.log("DEBUG: Session naming success", nameData);
+            if (nameData.title) setSessionTitle(nameData.title)
+          } else {
+            console.error("DEBUG: Session naming failed", r.status);
+          }
+        })
+      }
     } catch {
       setMessages((prev) => [...prev, { role: 'assistant', content: "Failed to reach the backend. Make sure the Python server is running on port 8000." }])
     } finally {
       setIsLoading(false)
       setSelectedOptions((prev) => prev.filter(o => o.type !== 'paper'))
-      // Deep Search persists for the session
     }
   }
 
@@ -616,13 +834,6 @@ function PageContent() {
       type: 'tool' as const
     },
     {
-      id: "research",
-      label: "Deep Research",
-      icon: <SparklesIcon className="size-4" />,
-      color: "text-purple-500",
-      type: 'tool' as const
-    },
-    {
       id: "context",
       label: "Pull Context",
       icon: <DatabaseIcon className="size-4" />,
@@ -644,8 +855,8 @@ function PageContent() {
           <Breadcrumb>
             <BreadcrumbList>
               <BreadcrumbItem>
-                <BreadcrumbPage className="line-clamp-1 font-semibold text-[#1a1a1a]/60">
-                  Project Management & Task Tracking
+                <BreadcrumbPage className="line-clamp-1 font-semibold text-[#1a1a1a]/60 capitalize">
+                  {sessionTitle}
                 </BreadcrumbPage>
               </BreadcrumbItem>
             </BreadcrumbList>
@@ -665,7 +876,12 @@ function PageContent() {
             <FileTextIcon className="size-4" />
             <span className="sr-only">Toggle Document Panel</span>
           </Button>
-          <Button variant="outline" size="sm" className="h-9 gap-2 px-3 border-black/10 bg-black/[0.02] hover:bg-black/5 text-black">
+          <Button 
+            variant="outline" 
+            size="sm" 
+            className="h-9 gap-2 px-3 border-black/10 bg-black/[0.02] hover:bg-black/5 text-black"
+            onClick={() => setIsShareModalOpen(true)}
+          >
             <Share2Icon className="size-4" />
             <span className="font-medium">Share</span>
           </Button>
@@ -674,12 +890,23 @@ function PageContent() {
 
       <div className="flex flex-1 overflow-hidden relative">
         <motion.div
+          onScroll={handleScroll}
           animate={{
-            marginRight: isDocPanelOpen ? 400 : 0
+            marginRight: isDocPanelOpen ? 400 : (activeProjectId ? 340 : 0)
           }}
           transition={{ type: "spring", damping: 25, stiffness: 200 }}
           className="flex-1 overflow-auto flex flex-col relative h-[calc(100vh-64px)] scrollbar-hide"
         >
+          {activeProjectId && (
+            <div className="w-full max-w-3xl mx-auto px-6 pt-10 pb-4 flex items-center justify-between">
+              <h2 className="text-[28px] font-bold text-[#1a1a1a] tracking-tight font-serif">{projects.find(p => p.id === activeProjectId)?.name || "Project"}</h2>
+              <div className="flex items-center gap-2">
+                <Button variant="ghost" size="icon" className="size-8 text-black/40 hover:text-black hover:bg-black/5 rounded-full"><MoreVerticalIcon className="size-4" /></Button>
+                <Button variant="ghost" size="icon" className="size-8 text-black/40 hover:text-black hover:bg-black/5 rounded-full"><StarIcon className="size-4" /></Button>
+              </div>
+            </div>
+          )}
+
           <style jsx global>{`
             .scrollbar-hide::-webkit-scrollbar {
               display: none;
@@ -706,12 +933,31 @@ function PageContent() {
                 exit={{ opacity: 0, y: 100, transition: { duration: 0.3, ease: "easeInOut" } }}
                 className="flex flex-col items-center justify-center min-h-full w-full p-4"
               >
-                <h1 className="text-[48px] font-medium mb-6 tracking-tight flex items-center gap-4 text-[#1a1a1a]">
-                  <span className="text-[#ff751f] text-[40px] leading-none">✸</span> Good evening, Orange
-                </h1>
+                {!activeProjectId && (
+                  <>
+                    <h1 className="text-[48px] font-medium mb-3 tracking-tight flex items-center gap-4 text-[#1a1a1a]">
+                      <span className="text-[#ff751f] text-[40px] leading-none">✸</span> {greeting}
+                    </h1>
+                    <p className="text-[18px] text-black/40 mb-8 font-medium">{subGreeting}</p>
+                  </>
+                )}
 
-                <div className="w-full max-w-[720px]">
-                  <div className="relative flex flex-col bg-white border border-black/15 rounded-[28px] p-3">
+                <div className={cn("w-full relative group", activeProjectId ? "max-w-3xl mt-0" : "max-w-[720px]")}>
+                  {/* Slow moving orange glow border that moves around */}
+                  <div className="absolute inset-0 rounded-[28px] overflow-hidden">
+                    <motion.div
+                      animate={{
+                        rotate: [0, 360],
+                      }}
+                      transition={{
+                        duration: 8,
+                        repeat: Infinity,
+                        ease: "linear"
+                      }}
+                      className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[250%] h-[250%] bg-[conic-gradient(from_0deg,transparent_0deg,transparent_280deg,#ff751f_360deg)] opacity-40 blur-[2px] -z-10"
+                    />
+                  </div>
+                  <div className="relative flex flex-col bg-white border border-black/35 rounded-[28px] p-3 shadow-sm transition-all duration-500 group-hover:border-orange-500/30">
 
                     {selectedOptions.length > 0 && (
                       <div className="flex flex-wrap gap-2 mb-3 px-2">
@@ -757,25 +1003,6 @@ function PageContent() {
                         </Button>
 
                         <div className="absolute left-[60px] top-1/2 -translate-y-1/2 flex items-center gap-2 pr-4">
-                          <span className={cn("text-[10px] font-bold uppercase tracking-wider transition-colors whitespace-nowrap", isDeepSearch ? "text-orange-500" : "text-black/20")}>
-                            Deep Dive
-                          </span>
-                          <button
-                            onClick={(e) => {
-                              e.preventDefault();
-                              setIsDeepSearch(!isDeepSearch);
-                            }}
-                            className={cn(
-                              "relative w-8 h-4.5 rounded-full transition-colors duration-200 outline-none",
-                              isDeepSearch ? "bg-orange-500" : "bg-black/10"
-                            )}
-                          >
-                            <motion.div
-                              animate={{ x: isDeepSearch ? 16 : 2 }}
-                              className="absolute top-1/2 -translate-y-1/2 size-3 bg-white rounded-full shadow-sm"
-                              transition={{ type: "spring", stiffness: 500, damping: 30 }}
-                            />
-                          </button>
                         </div>
                         <AnimatePresence>
                           {isPlusMenuOpen && (
@@ -891,103 +1118,55 @@ function PageContent() {
                 <div className="w-full max-w-3xl flex flex-col gap-8 py-12 px-6 pb-[240px]">
                   {messages.map((msg, i) => {
                     const isLastUserMsg = i === messages.length - 2 && msg.role === 'user'
-                    return msg.role === 'user' ? (
-                      <div key={i} id={isLastUserMsg ? "last-user-interaction" : undefined} className="flex flex-col w-full animate-in fade-in slide-in-from-right-4 duration-500">
-                        <div className="flex justify-end w-full mb-2">
-                          <div className="bg-[#1a1a1a] px-6 py-2.5 rounded-[18px] shadow-sm max-w-[85%]">
-                            <p className="text-[14.5px] leading-relaxed text-white">{msg.content}</p>
-                          </div>
-                        </div>
-                      </div>
-                    ) : (
-                      <div key={i} className="flex flex-col w-full animate-in fade-in slide-in-from-left-4 duration-500">
-                        <div className="flex justify-start w-full">
-                          <div className="flex flex-col gap-4 w-full max-w-[95%]">
-                            <div className="flex gap-4 items-start">
-                              <div className="size-8 rounded-full bg-orange-50 border border-orange-100 flex items-center justify-center shrink-0 mt-1">
-                                <span className="text-orange-500 text-lg font-bold leading-none">✸</span>
-                              </div>
-                              <div className="flex flex-col gap-3 flex-1 pt-1 overflow-hidden prose prose-sm max-w-none">
-                                <ReactMarkdown
-                                  remarkPlugins={[remarkGfm]}
-                                  components={{
-                                    h1: ({ node, ...props }) => <h1 className="text-xl font-bold mb-2 text-black" {...props} />,
-                                    h2: ({ node, ...props }) => <h2 className="text-lg font-bold mb-2 text-black" {...props} />,
-                                    h3: ({ node, ...props }) => <h3 className="text-md font-bold mb-1 text-black" {...props} />,
-                                    p: ({ node, ...props }) => <p className="text-black/80 leading-relaxed mb-3" {...props} />,
-                                    ul: ({ node, ...props }) => <ul className="list-disc pl-4 mb-3 space-y-1" {...props} />,
-                                    ol: ({ node, ...props }) => <ol className="list-decimal pl-4 mb-3 space-y-1" {...props} />,
-                                    li: ({ node, ...props }) => <li className="text-black/80" {...props} />,
-                                    table: ({ node, ...props }) => (
-                                      <div className="overflow-x-auto my-4 border border-black/10 rounded-xl bg-white shadow-sm overflow-hidden">
-                                        <div className="flex items-center justify-between px-4 py-2 bg-black/[0.02] border-b border-black/5">
-                                          <span className="text-[10px] font-bold text-black/30 uppercase tracking-widest">Data Table</span>
-                                          <Button variant="ghost" size="sm" className="h-6 gap-1.5 px-2 text-[10px] text-black/40 hover:text-black" onClick={() => handleCopy(node?.position ? "" : "")}>
-                                            <CopyIcon className="size-3" />
-                                            Copy
-                                          </Button>
-                                        </div>
-                                        <table className="w-full text-left text-[13px] border-collapse" {...props} />
-                                      </div>
-                                    ),
-                                    thead: ({ node, ...props }) => <thead className="bg-[#fafafa] border-b border-black/5 text-black/40" {...props} />,
-                                    th: ({ node, ...props }) => <th className="px-4 py-3 font-semibold" {...props} />,
-                                    td: ({ node, ...props }) => <td className="px-4 py-3 border-b border-black/5 text-black/70" {...props} />,
-                                    code: ({ node, inline, className, children, ...props }: any) => {
-                                      const match = /language-(\w+)/.exec(className || '')
-                                      if (!inline && match?.[1] === 'chart') {
-                                        return <ChartRenderer data={String(children).replace(/\n$/, '')} />
-                                      }
-
-                                      return !inline ? (
-                                        <div className="my-4 overflow-hidden rounded-xl border border-black/10 bg-[#0d0d0d] shadow-2xl">
-                                          <div className="flex items-center justify-between px-4 py-2 bg-[#1a1a1a] border-b border-white/5">
-                                            <div className="flex items-center gap-1.5">
-                                              <div className="flex gap-1">
-                                                <div className="size-2.5 rounded-full bg-[#ff5f56]" />
-                                                <div className="size-2.5 rounded-full bg-[#ffbd2e]" />
-                                                <div className="size-2.5 rounded-full bg-[#27c93f]" />
-                                              </div>
-                                              <span className="text-[10px] font-mono text-white/30 uppercase ml-2">{match?.[1] || 'code'}</span>
-                                            </div>
-                                            <Button variant="ghost" size="sm" className="h-6 gap-1.5 px-2 text-[10px] text-white/40 hover:text-white hover:bg-white/5" onClick={() => handleCopy(String(children).replace(/\n$/, ''))}>
-                                              <CopyIcon className="size-3" />
-                                              Copy
-                                            </Button>
-                                          </div>
-                                          <div className="p-4 overflow-x-auto">
-                                            <code className="text-[13px] font-mono text-white/90 leading-relaxed block" {...props}>
-                                              {children}
-                                            </code>
-                                          </div>
-                                        </div>
-                                      ) : (
-                                        <code className="bg-black/5 rounded px-1 py-0.5 font-mono text-xs" {...props}>
-                                          {children}
-                                        </code>
-                                      )
-                                    },
-                                  }}
-                                >
-                                  {msg.content}
-                                </ReactMarkdown>
-                                <div className="flex items-center gap-1.5 mt-1">
-                                  <Button variant="ghost" size="icon" className="size-8 text-black/20 hover:text-black hover:bg-black/5 rounded-lg transition-colors" onClick={() => handleCopy(msg.content)}>
-                                    <CopyIcon className="size-3.5" />
-                                  </Button>
-                                  <Button variant="ghost" size="icon" className="size-8 text-black/20 hover:text-black hover:bg-black/5 rounded-lg transition-colors" onClick={() => handleFeedback(i, 'like')}>
-                                    <ThumbsUpIcon className="size-3.5" />
-                                  </Button>
-                                  <Button variant="ghost" size="icon" className="size-8 text-black/20 hover:text-black hover:bg-black/5 rounded-lg transition-colors" onClick={() => handleFeedback(i, 'dislike')}>
-                                    <ThumbsDownIcon className="size-3.5" />
-                                  </Button>
-                                </div>
+                    return (
+                      <React.Fragment key={i}>
+                        {msg.role === 'user' ? (
+                          <div id={isLastUserMsg ? "last-user-interaction" : undefined} className="flex flex-col w-full animate-in fade-in slide-in-from-right-4 duration-500 group/msg mb-4">
+                            <div className="flex justify-end w-full mb-1">
+                              <div className="bg-[#1a1a1a] px-5 py-2.5 rounded-[22px] rounded-tr-[4px] shadow-sm max-w-[85%] relative border border-white/5">
+                                <p className="text-[14.5px] leading-relaxed text-white whitespace-pre-wrap">{msg.content}</p>
                               </div>
                             </div>
+                            <div className="flex items-center justify-end gap-3 px-1 transition-opacity opacity-0 group-hover/msg:opacity-100">
+                               <span className="text-[10px] font-bold text-black/20 uppercase tracking-widest">{msg.timestamp}</span>
+                               <div className="flex items-center gap-1">
+                                 <button 
+                                   onClick={() => {
+                                     setPromptValue(msg.content);
+                                     setMessages(prev => prev.filter((_, idx) => idx !== i));
+                                   }}
+                                   className="p-1 text-black/20 hover:text-orange-500 transition-colors"
+                                   title="Edit message"
+                                 >
+                                   <PenLineIcon className="size-3.5" />
+                                 </button>
+                                 <button 
+                                   onClick={() => {
+                                     navigator.clipboard.writeText(msg.content);
+                                     setToast({ message: "Copied to clipboard", type: 'success' });
+                                   }}
+                                   className="p-1 text-black/20 hover:text-orange-500 transition-colors"
+                                   title="Copy message"
+                                 >
+                                   <CopyIcon className="size-3.5" />
+                                 </button>
+                               </div>
+                            </div>
                           </div>
-                        </div>
-                        <div className="w-full h-px bg-black/[0.03] my-10" />
-                      </div>
+                        ) : (
+                          <ChatMessage
+                            message={msg}
+                            index={i}
+                            isLatest={i === messages.length - 1}
+                            isLoading={isLoading}
+                            onCopy={handleCopy}
+                            onFeedback={handleFeedback}
+                          />
+                        )}
+                        {msg.role === 'assistant' && i < messages.length - 1 && (
+                          <div className="w-full h-px bg-black/[0.03] my-10" />
+                        )}
+                      </React.Fragment>
                     )
                   })}
 
@@ -1050,8 +1229,21 @@ function PageContent() {
                   className="w-full flex flex-col items-center pb-8 pt-4 pointer-events-none"
                 >
                   <div className="w-full max-w-[800px] px-6 pointer-events-auto relative">
+                    <AnimatePresence>
+                      {showScrollButton && (
+                        <motion.button
+                          initial={{ opacity: 0, scale: 0.8, y: 10 }}
+                          animate={{ opacity: 1, scale: 1, y: 0 }}
+                          exit={{ opacity: 0, scale: 0.8, y: 10 }}
+                          onClick={scrollToBottom}
+                          className="absolute -top-[52px] left-1/2 -translate-x-1/2 size-10 bg-white border border-black/[0.08] shadow-[0_4px_12px_rgba(0,0,0,0.05)] rounded-full flex items-center justify-center text-black/60 hover:text-black hover:bg-black/[0.02] hover:shadow-[0_4px_16px_rgba(0,0,0,0.08)] transition-all z-50 pointer-events-auto active:scale-95"
+                        >
+                          <ArrowDownIcon className="size-4" strokeWidth={2.5} />
+                        </motion.button>
+                      )}
+                    </AnimatePresence>
                     <div className={cn(
-                      "relative flex flex-col bg-white border border-black/15 rounded-[28px] p-3 shadow-none transition-all duration-300",
+                      "relative flex flex-col bg-white border border-black/35 rounded-[28px] p-3 shadow-none transition-all duration-300",
                       activeOptions ? "min-h-[200px]" : "pb-2"
                     )}>
                       <AnimatePresence mode="wait">
@@ -1113,21 +1305,19 @@ function PageContent() {
                                     }}
                                     onMouseEnter={() => setFocusedOptionIndex(idx)}
                                     className={cn(
-                                      "w-full flex items-center gap-3 p-3 rounded-xl transition-all duration-200 text-left group",
-                                      focusedOptionIndex === idx
-                                        ? "bg-[#f9f8f4] translate-x-1"
-                                        : isSelected ? "bg-black/[0.02]" : "hover:bg-black/[0.01]"
+                                      "w-full flex items-center gap-4 py-4 px-2 transition-all duration-200 text-left group border-b border-black/5 last:border-0",
+                                      focusedOptionIndex === idx ? "bg-black/[0.02]" : ""
                                     )}
                                   >
                                     <div className={cn(
-                                      "size-7 rounded-lg flex items-center justify-center text-[11px] font-medium transition-colors",
-                                      isSelected ? "bg-black text-white" : focusedOptionIndex === idx ? "bg-black/10 text-black" : "bg-black/[0.05] text-black/40"
+                                      "size-6 flex shrink-0 items-center justify-center rounded-[6px] transition-colors",
+                                      isSelected ? "bg-black text-white" : "border border-black/20 bg-transparent text-transparent"
                                     )}>
-                                      {isSelected ? <CheckIcon className="size-3.5" /> : idx + 1}
+                                      <CheckIcon className="size-3.5" strokeWidth={3} />
                                     </div>
                                     <span className={cn(
-                                      "text-[14px] transition-colors",
-                                      isSelected ? "text-black font-semibold" : focusedOptionIndex === idx ? "text-black font-medium" : "text-black/60"
+                                      "text-[15px] transition-colors leading-relaxed",
+                                      isSelected ? "text-black font-semibold" : "text-black/70 font-medium"
                                     )}>
                                       {label}
                                     </span>
@@ -1144,22 +1334,22 @@ function PageContent() {
                                   setTimeout(() => document.querySelector('textarea')?.focus(), 50);
                                 }}
                                 className={cn(
-                                  "w-full flex items-center gap-3 p-3 rounded-xl transition-all duration-200 text-left group border border-transparent",
+                                  "w-full flex items-center gap-4 py-4 px-2 transition-all duration-200 text-left group",
                                   focusedOptionIndex === (activeOptions.steps ? (activeOptions.steps[currentStepIndex]?.options.length || 0) : (activeOptions.options?.length || 0))
-                                    ? "bg-[#f9f8f4] border-black/5"
-                                    : "hover:bg-black/[0.02]"
+                                    ? "bg-black/[0.02]"
+                                    : ""
                                 )}
                                 onMouseEnter={() => setFocusedOptionIndex(activeOptions.steps ? (activeOptions.steps[currentStepIndex]?.options.length || 0) : (activeOptions.options?.length || 0))}
                               >
                                 <div className={cn(
-                                  "size-7 rounded-lg flex items-center justify-center transition-colors",
-                                  focusedOptionIndex === (activeOptions.steps ? (activeOptions.steps[currentStepIndex]?.options.length || 0) : (activeOptions.options?.length || 0)) ? "bg-black text-white" : "bg-black/[0.05] text-black/40"
+                                  "size-6 flex shrink-0 items-center justify-center rounded-[6px] transition-colors",
+                                  "border border-black/10 bg-black/[0.02] text-black/40"
                                 )}>
-                                  <PenLineIcon className="size-4" />
+                                  <PenLineIcon className="size-3.5" />
                                 </div>
                                 <span className={cn(
-                                  "text-[14px] transition-colors",
-                                  focusedOptionIndex === (activeOptions.steps ? (activeOptions.steps[currentStepIndex]?.options.length || 0) : (activeOptions.options?.length || 0)) ? "text-black font-medium" : "text-black/20 italic"
+                                  "text-[15px] transition-colors leading-relaxed italic",
+                                  focusedOptionIndex === (activeOptions.steps ? (activeOptions.steps[currentStepIndex]?.options.length || 0) : (activeOptions.options?.length || 0)) ? "text-black font-medium" : "text-black/40"
                                 )}>
                                   Something else
                                 </span>
@@ -1305,25 +1495,6 @@ function PageContent() {
                                 </Button>
 
                                 <div className="absolute left-[52px] top-1/2 -translate-y-1/2 flex items-center gap-1.5 pr-4">
-                                  <span className={cn("text-[9px] font-bold uppercase tracking-wider transition-colors whitespace-nowrap", isDeepSearch ? "text-orange-500" : "text-black/20")}>
-                                    Deep Dive
-                                  </span>
-                                  <button
-                                    onClick={() => setIsDeepSearch(!isDeepSearch)}
-                                    className={cn(
-                                      "relative w-7 h-4 rounded-full transition-colors duration-200 outline-none",
-                                      isDeepSearch ? "bg-orange-500" : "bg-black/10"
-                                    )}
-                                  >
-                                    <motion.div
-                                      animate={{ x: isDeepSearch ? 14 : 2 }}
-                                      className="absolute top-1/2 -translate-y-1/2 size-2.5 bg-white rounded-full shadow-sm"
-                                      transition={{ type: "spring", stiffness: 500, damping: 30 }}
-                                    />
-                                  </button>
-
-                                  <div className="w-px h-3.5 bg-black/10 mx-1" />
-
                                   <button
                                     onClick={() => setIsWebMode(!isWebMode)}
                                     className={cn(
@@ -1455,149 +1626,97 @@ function PageContent() {
 
         <AnimatePresence>
           {isDocPanelOpen && (
-            <motion.div
-              initial={{ x: "100%" }}
-              animate={{ x: 0 }}
-              exit={{ x: "100%" }}
-              transition={{ type: "spring", damping: 25, stiffness: 200 }}
-              className="absolute top-0 right-0 z-50 h-full w-[400px] border-l border-black/5 bg-[#fffaf7]/95 backdrop-blur-xl flex flex-col pt-10 rounded-l-[40px] scrollbar-hide overflow-y-auto"
-            >
-              <div className="flex items-center justify-between px-8 mb-8 shrink-0">
-                <h2 className="text-[20px] font-bold text-black tracking-tight">Research Papers</h2>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="size-9 text-black/30 hover:text-black hover:bg-black/5 rounded-full"
-                  onClick={() => setIsDocPanelOpen(false)}
-                >
-                  <XIcon className="size-5" />
-                </Button>
-              </div>
-
-              <div className="flex-1 px-6 pb-12 space-y-4">
-                {papers.map((paper) => (
-                  <div key={paper.id} className="group relative bg-white rounded-[24px] p-6 shadow-sm border border-black/[0.05] hover:border-black/10 transition-all duration-300">
-                    <div className="flex justify-between items-start mb-4">
-                      <div className="size-11 rounded-full bg-green-50 flex items-center justify-center border border-green-100/50">
-                        <div className="flex items-center gap-[1px] leading-none mb-0.5">
-                          <span className="text-green-600 font-bold text-[18px] leading-none">{paper.score}</span>
-                          <span className="text-green-600/80 font-bold text-[11px] mt-1">%</span>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-1.5 relative">
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className={cn(
-                            "size-8 rounded-full transition-colors",
-                            summaryPaperId === paper.id ? "bg-black/5 text-black" : "text-black/30 hover:text-black hover:bg-black/5"
-                          )}
-                          title="View summary"
-                          onClick={() => setSummaryPaperId(summaryPaperId === paper.id ? null : paper.id)}
-                        >
-                          <InfoIcon className="size-4" />
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="size-8 text-black/30 hover:text-black hover:bg-black/5 rounded-full"
-                          title="Read paper"
-                        >
-                          <BookOpenIcon className="size-4" />
-                        </Button>
-                        <div className="relative">
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className={cn(
-                              "h-8 rounded-lg gap-2 px-3 border-black/[0.05] transition-colors",
-                              savingPaperId === paper.id ? "bg-black text-white" : "bg-black/[0.02] text-black/60 hover:text-black"
-                            )}
-                            onClick={() => setSavingPaperId(savingPaperId === paper.id ? null : paper.id)}
-                          >
-                            <span className="text-[12px] font-medium">Save</span>
-                            <BookmarkIcon className="size-3.5" />
-                          </Button>
-
-                          <AnimatePresence>
-                            {savingPaperId === paper.id && (
-                              <motion.div
-                                initial={{ opacity: 0, scale: 0.95, y: 5 }}
-                                animate={{ opacity: 1, scale: 1, y: 0 }}
-                                exit={{ opacity: 0, scale: 0.95, y: 5 }}
-                                className="absolute top-full right-0 mt-2 w-[180px] bg-white border border-black/10 rounded-xl shadow-xl p-1.5 z-[60]"
-                              >
-                                <p className="px-2 py-1.5 text-[10px] font-bold text-black/30 uppercase tracking-wider">Save to project</p>
-                                {projects.map(project => (
-                                  <button
-                                    key={project}
-                                    className="w-full text-left px-2 py-1.5 text-[12px] text-black/60 hover:text-black hover:bg-black/5 rounded-md transition-colors"
-                                    onClick={() => setSavingPaperId(null)}
-                                  >
-                                    {project}
-                                  </button>
-                                ))}
-                              </motion.div>
-                            )}
-                          </AnimatePresence>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="space-y-1 mb-4">
-                      <div className="flex items-center gap-2">
-                        <span className="text-[13px] font-semibold text-black/80">{paper.publisher}</span>
-                        <span className="text-[11px] text-black/30 font-medium">• {paper.year}</span>
-                      </div>
-                      <h3 className="text-[16px] font-bold text-[#1a1a1a] leading-tight line-clamp-2">{paper.title}</h3>
-                    </div>
-
-                    <div className="flex flex-wrap gap-2 mb-4">
-                      {paper.tags.slice(0, 2).map(tag => (
-                        <span key={tag} className="px-3 py-1 bg-black/[0.03] text-[11px] text-black/60 font-medium rounded-full border border-black/[0.02]">
-                          {tag}
-                        </span>
-                      ))}
-                    </div>
-
-                    <div className="mb-4">
-                      <AnimatePresence>
-                        {summaryPaperId === paper.id && (
-                          <motion.div
-                            initial={{ height: 0, opacity: 0 }}
-                            animate={{ height: 'auto', opacity: 1, marginBottom: 16 }}
-                            exit={{ height: 0, opacity: 0, marginBottom: 0 }}
-                            className="overflow-hidden"
-                          >
-                            <p className="mt-1 text-[12px] leading-relaxed text-black/60 italic border-l-2 border-orange-200 pl-3 py-1">
-                              {paper.summary}
-                            </p>
-                          </motion.div>
-                        )}
-                      </AnimatePresence>
-                    </div>
-
-                    <div className="h-px bg-black/[0.04] mb-4" />
-
-                    <div className="flex items-center justify-between">
-                      <div className="flex flex-col">
-                        <span className="text-[15px] font-bold text-[#1a1a1a]">{paper.citations.toLocaleString()}</span>
-                        <span className="text-[10px] text-black/30 font-semibold tracking-wider uppercase">Citations</span>
-                      </div>
-                      <Button
-                        className="h-10 px-5 rounded-xl bg-[#1a1a1a] hover:bg-black text-white text-[13px] font-bold shadow-sm"
-                        onClick={() => toggleOption({ id: paper.id, label: paper.title, icon: <FileTextIcon className="size-4" />, color: "text-green-500", type: 'paper' })}
-                      >
-                        Pull In Chat
-                      </Button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </motion.div>
+            <ResearchPapersPanel
+              papers={papers as any}
+              isLoading={isLoading}
+              onClose={() => setIsDocPanelOpen(false)}
+              onSearch={(q) => handleSilentSearch(q)}
+              onPullInChat={(paper, extractedContext) => {
+                setPaperContexts(prev => ({ ...prev, [paper.id]: extractedContext }))
+                setSelectedOptions(prev => {
+                  if (prev.find(o => o.id === paper.id)) return prev;
+                  return [
+                    ...prev,
+                    {
+                      id: paper.id,
+                      label: paper.title,
+                      icon: <BookOpenIcon className="size-3" />,
+                      color: "bg-orange-500/10 text-orange-600",
+                      type: 'paper'
+                    }
+                  ]
+                })
+                setToast({ message: "Added to context", type: 'success' })
+              }}
+            />
           )}
         </AnimatePresence>
       </div >
+
+      {/* Right side Project Context Panel */}
+      <AnimatePresence>
+        {activeProjectId && !isDocPanelOpen && (
+          <motion.div
+             initial={{ opacity: 0, x: 20 }}
+             animate={{ opacity: 1, x: 0 }}
+             exit={{ opacity: 0, x: 20 }}
+             className="absolute right-0 top-16 bottom-0 w-[340px] border-l border-[#e5e5e5] bg-[#fafafa] flex flex-col overflow-y-auto"
+          >
+             <div className="p-4 space-y-4">
+               {/* Memory Card */}
+               <div className="bg-white rounded-[20px] p-5 shadow-sm border border-[#e5e5e5]">
+                 <div className="flex items-center justify-between mb-2">
+                   <h3 className="font-semibold text-[14px] text-[#1a1a1a]">Memory</h3>
+                   <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-black/5 text-black/40 text-[11px] font-medium">
+                     <LockIcon className="size-3" />
+                     Only you
+                   </div>
+                 </div>
+                 <p className="text-[13px] text-black/40 leading-relaxed">
+                   Project memory will show here after a few chats.
+                 </p>
+               </div>
+
+               {/* Instructions Card */}
+               <div className="bg-white rounded-[20px] p-5 shadow-sm border border-[#e5e5e5]">
+                 <div className="flex items-center justify-between mb-2">
+                   <h3 className="font-semibold text-[14px] text-[#1a1a1a]">Instructions</h3>
+                   <button className="size-6 flex items-center justify-center rounded-full hover:bg-black/5 text-black/40 hover:text-black transition-colors">
+                     <PlusIcon className="size-4" />
+                   </button>
+                 </div>
+                 <p className="text-[13px] text-black/40 leading-relaxed">
+                   Add instructions to tailor Revio's responses
+                 </p>
+               </div>
+
+               {/* Files Card */}
+               <div className="bg-white rounded-[20px] p-5 shadow-sm border border-[#e5e5e5]">
+                 <div className="flex items-center justify-between mb-4">
+                   <h3 className="font-semibold text-[14px] text-[#1a1a1a]">Files</h3>
+                   <button className="size-6 flex items-center justify-center rounded-full hover:bg-black/5 text-black/40 hover:text-black transition-colors">
+                     <PlusIcon className="size-4" />
+                   </button>
+                 </div>
+                 <div className="bg-[#f5f4ef] rounded-2xl p-6 flex flex-col items-center justify-center text-center border overflow-hidden border-dashed border-black/10">
+                   <div className="flex -space-x-3 mb-4 scale-90 opacity-40">
+                      <div className="size-10 bg-white border border-black/20 rounded-md shadow-sm transform -rotate-6" />
+                      <div className="size-10 bg-white border border-black/20 rounded-md shadow-sm transform rotate-6" />
+                      <div className="size-10 bg-white border border-black/20 rounded-md shadow-sm z-10 flex items-center justify-center">
+                        <PlusIcon className="size-4 stroke-[3]" />
+                      </div>
+                   </div>
+                   <p className="text-[12px] font-medium text-black/50 leading-relaxed px-2">
+                     Add PDFs, documents, or other text to reference in this project.
+                   </p>
+                 </div>
+               </div>
+
+             </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       <input
         type="file"
         ref={fileInputRef}
@@ -1612,6 +1731,140 @@ function PageContent() {
       />
 
       {/* Global Toast */}
+      {/* Share Modal */}
+      <AnimatePresence>
+        {isShareModalOpen && (
+          <div className="fixed inset-0 z-[110] flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsShareModalOpen(false)}
+              className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 10 }}
+              className="relative w-full max-w-[500px] bg-[#fffaf5] rounded-[32px] overflow-hidden shadow-2xl border border-white/40"
+            >
+              <div className="p-10">
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className="text-[24px] font-bold text-black tracking-tight">Share chat</h3>
+                  <button 
+                    onClick={() => setIsShareModalOpen(false)}
+                    className="size-9 flex items-center justify-center text-black/20 hover:text-black hover:bg-black/5 rounded-full transition-all"
+                  >
+                    <XIcon className="size-6" />
+                  </button>
+                </div>
+                <p className="text-[16px] text-black/40 font-medium mb-8">Only messages up to this point will be shared.</p>
+
+                <div className="space-y-0 border border-black/5 rounded-[24px] overflow-hidden bg-white/50 mb-6">
+                  <button 
+                    onClick={() => setShareMode('private')}
+                    className={cn(
+                      "w-full flex items-center justify-between px-8 py-6 transition-all group",
+                      shareMode === 'private' ? "bg-white" : "hover:bg-white/40"
+                    )}
+                  >
+                    <div className="flex items-center gap-5">
+                      <div className={cn(
+                        "size-12 rounded-full flex items-center justify-center border",
+                        shareMode === 'private' ? "bg-orange-500/5 border-orange-200 text-orange-600" : "bg-black/5 border-transparent text-black/30 group-hover:text-black/60"
+                      )}>
+                        <LockIcon className="size-6" />
+                      </div>
+                      <div className="text-left">
+                        <p className="text-[17px] font-bold text-black">Keep private</p>
+                        <p className="text-[14px] text-black/40 font-medium">Only you have access</p>
+                      </div>
+                    </div>
+                    {shareMode === 'private' && <CheckIcon className="size-6 text-blue-500" />}
+                  </button>
+
+                  <div className="h-px bg-black/5 mx-8" />
+
+                  <button 
+                    onClick={() => setShareMode('public')}
+                    className={cn(
+                      "w-full flex items-center justify-between px-8 py-6 transition-all group",
+                      shareMode === 'public' ? "bg-white" : "hover:bg-white/40"
+                    )}
+                  >
+                    <div className="flex items-center gap-5">
+                      <div className={cn(
+                        "size-12 rounded-full flex items-center justify-center border",
+                        shareMode === 'public' ? "bg-orange-500/5 border-orange-200 text-orange-600" : "bg-black/5 border-transparent text-black/30 group-hover:text-black/60"
+                      )}>
+                        <GlobeIcon className="size-6" />
+                      </div>
+                      <div className="text-left">
+                        <p className="text-[17px] font-bold text-black">Create public link</p>
+                        <p className="text-[14px] text-black/40 font-medium">Anyone with the link can view</p>
+                      </div>
+                    </div>
+                    {shareMode === 'public' && <CheckIcon className="size-6 text-blue-500" />}
+                  </button>
+                </div>
+
+                {shareMode === 'public' && (
+                  <motion.div 
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: 'auto' }}
+                    className="mb-8"
+                  >
+                    <div className="flex items-center gap-2 p-3 bg-black/[0.03] border border-black/5 rounded-xl">
+                      <input 
+                        readOnly 
+                        value={`${window.location.origin}${window.location.pathname}?session=${sessionId}`}
+                        className="flex-1 bg-transparent text-[13px] text-black/60 outline-none px-2"
+                      />
+                      <Button 
+                        size="sm" 
+                        variant="ghost" 
+                        className="h-8 gap-2 text-orange-500 hover:text-orange-600 hover:bg-orange-50"
+                        onClick={() => {
+                          const url = `${window.location.origin}${window.location.pathname}?session=${sessionId}`;
+                          navigator.clipboard.writeText(url);
+                          setToast({ message: "URL copied to clipboard!", type: 'success' });
+                        }}
+                      >
+                        <CopyIcon className="size-3.5" />
+                        Copy
+                      </Button>
+                    </div>
+                    <p className="text-[11px] text-black/30 mt-2 px-1">This link allows anyone with the link to view this chat after they authenticate.</p>
+                  </motion.div>
+                )}
+
+                <div className="mt-2">
+                  <p className="text-[13px] text-black/40 leading-relaxed font-medium mb-8">
+                    Don’t share personal information or third-party content without permission, and see our <span className="underline cursor-pointer">Usage Policy</span>.
+                  </p>
+
+                  <Button 
+                    className="w-full h-14 rounded-[20px] bg-[#1a1a1a] hover:bg-[#000] text-white font-bold text-[17px] shadow-sm"
+                    onClick={() => {
+                      if (shareMode === 'public') {
+                        const url = `${window.location.origin}${window.location.pathname}?session=${sessionId}`;
+                        navigator.clipboard.writeText(url);
+                        setToast({ message: "Public link created and copied!", type: 'success' });
+                      } else {
+                        setToast({ message: "Access updated to private", type: 'success' });
+                      }
+                      setIsShareModalOpen(false);
+                    }}
+                  >
+                    {shareMode === 'public' ? "Create share link" : "Update access"}
+                  </Button>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       <AnimatePresence>
         {toast && (
           <motion.div
